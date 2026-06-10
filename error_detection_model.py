@@ -548,7 +548,7 @@ class ErrorDetectionTrainer:
     def load_model(self, filename: str):
         """Загрузка модели"""
         model_path = os.path.join(config.MODELS_DIR, filename)
-        checkpoint = torch.load(model_path, map_location=self.device)
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         
         self.model = ErrorDetectionModel(checkpoint['model_name'])
         self.model.load_state_dict(checkpoint['model_state_dict'])

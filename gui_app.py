@@ -241,7 +241,7 @@ class OrderCheckerGUI:
         self.validator = OrderStructureValidator()
         self.model_available = False
         self.trainer = None
-        self._load_model()
+        self._model_loading = True  # флаг: идёт загрузка
 
         self.current_file = None
         self.current_text = None
@@ -252,19 +252,43 @@ class OrderCheckerGUI:
 
         self._build_ui()
 
+        # Загружаем модель в фоне — GUI не зависает
+        threading.Thread(target=self._load_model_bg, daemon=True).start()
+
     # ------------------------------------------------------------------ model
-    def _load_model(self):
+    def _load_model_bg(self):
+        """Фоновая загрузка модели; обновляет UI через after()."""
         try:
             model_path = os.path.join(config.MODELS_DIR, "best_error_detection_model.pt")
             if os.path.exists(model_path):
-                self.trainer = ErrorDetectionTrainer()
-                self.trainer.load_model("best_error_detection_model.pt")
+                trainer = ErrorDetectionTrainer()
+                trainer.load_model("best_error_detection_model.pt")
+                self.trainer = trainer
                 self.model_available = True
                 print("✓ Модель загружена")
+                self.root.after(0, self._on_model_ready)
             else:
                 print("⚠ Модель не найдена, используется только проверка структуры")
+                self.root.after(0, self._on_model_missing)
         except Exception as e:
             print(f"Ошибка загрузки модели: {e}")
+            self.root.after(0, self._on_model_missing)
+        finally:
+            self._model_loading = False
+
+    def _on_model_ready(self):
+        """Вызывается из главного потока после успешной загрузки модели."""
+        try:
+            self._status_label.config(text="✓ Модель активна", bg="#1E8449")
+        except Exception:
+            pass
+
+    def _on_model_missing(self):
+        """Вызывается из главного потока если модель не загружена."""
+        try:
+            self._status_label.config(text="⚠ Только структура", bg="#E67E22")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ build
     def _build_ui(self):
@@ -286,14 +310,14 @@ class OrderCheckerGUI:
             bg=self.RED, fg=self.WHITE,
         ).pack(side=tk.LEFT, padx=20, pady=10)
 
-        status_text = "✓ Модель активна" if self.model_available else "⚠ Только структура"
-        status_bg = "#1E8449" if self.model_available else "#E67E22"
-        tk.Label(
-            hf, text=status_text,
+        # Начальное состояние — модель ещё грузится
+        self._status_label = tk.Label(
+            hf, text="⏳ Загрузка модели...",
             font=("Arial", 9, "bold"),
-            bg=status_bg, fg=self.WHITE,
+            bg="#7F8C8D", fg=self.WHITE,
             padx=10, pady=4, relief=tk.RAISED,
-        ).pack(side=tk.RIGHT, padx=15, pady=12)
+        )
+        self._status_label.pack(side=tk.RIGHT, padx=15, pady=12)
 
     def _build_toolbar(self):
         tf = tk.Frame(self.root, bg=self.BLUE, padx=15, pady=10)
@@ -444,6 +468,13 @@ class OrderCheckerGUI:
         self.result_text.tag_config("normal",   foreground="#2C3E50",      font=("Consolas", 10))
         self.result_text.tag_config("corr",     foreground="#C0392B",      font=("Consolas", 10, "bold"))
         self.result_text.tag_config("corr_note", foreground="#566573",    font=("Consolas", 9))
+        self.result_text.tag_config("purple",      foreground="#7D3C98",    font=("Consolas", 10, "bold"))
+        self.result_text.tag_config("hl_vague",    background="#FFF3CD", foreground="#7D5A00",
+                                    font=("Consolas", 10, "bold"))
+        self.result_text.tag_config("hl_corrupt",  background="#F8D7DA", foreground="#721C24",
+                                    font=("Consolas", 10, "bold"))
+        self.result_text.tag_config("hl_structure", background="#CCE5FF", foreground="#004085",
+                                    font=("Consolas", 10, "italic"))
 
         # section data pane (hidden initially)
         self.sec_pane = tk.Frame(cf, bg=self.WHITE)
@@ -845,237 +876,519 @@ class OrderCheckerGUI:
         self.save_btn.config(state=tk.NORMAL)
 
     def _display_results(self, vr, mr):
-        import re
-        rt   = self.result_text
-        text = self.current_text
-        rt.delete(1.0, tk.END)
-        self.content_title.config(text="📊 РЕЗУЛЬТАТЫ ПРОВЕРКИ СТРУКТУРЫ ПРИКАЗА")
+        """
+        Отображает полное экспертное заключение на экране (14 разделов).
+        vr = validation_result (словарь от OrderStructureValidator.validate)
+        mr = model_result (от ErrorDetectionTrainer.predict, может быть None)
+        """
+        self._show_doc_pane()
+        self.content_title.config(text="📊 ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ")
+        t = self.result_text
+        t.delete(1.0, tk.END)
 
-        st     = self._doc_stats(text)
-        checks = self._quick_scan(text)
-        found  = sum(1 for _, ok, _ in checks if ok)
-        total  = len(checks)
-        pct    = found * 100 // total
+        def ins(text, tag="normal"):
+            t.insert(tk.END, text, tag)
 
-        # ── шапка ─────────────────────────────────────────────────────────
-        rt.insert(tk.END, "=" * 80 + "\n", "header")
-        rt.insert(tk.END, "  РЕЗУЛЬТАТЫ ПРОВЕРКИ СТРУКТУРЫ ПРИКАЗА МЭР\n", "header")
-        rt.insert(tk.END, "=" * 80 + "\n\n", "header")
+        def h1(text):
+            ins("═" * 80 + "\n", "header")
+            ins(f"  {text}\n", "header")
+            ins("═" * 80 + "\n", "header")
 
-        rt.insert(tk.END, f"  Файл    : {os.path.basename(self.current_file)}\n")
-        rt.insert(tk.END, f"  Дата    : {datetime.now().strftime('%d.%m.%Y  %H:%M:%S')}\n")
-        rt.insert(tk.END, f"  Размер  : {st['chars']:,} симв. / {st['words']:,} слов / "
-                          f"{st['lines']} строк\n\n")
+        def h2(text):
+            ins(f"\n{text}\n", "section")
+            ins("─" * 80 + "\n", "section")
 
-        # ── итог ──────────────────────────────────────────────────────────
-        if vr["is_valid"] and pct >= 80:
-            rt.insert(tk.END, "  [ИТОГ]  СТРУКТУРА ДОКУМЕНТА КОРРЕКТНА\n", "success")
-        elif vr["total_errors"] == 0:
-            rt.insert(tk.END, "  [ИТОГ]  Критических ошибок нет, есть замечания\n", "warning")
+        def row(label, value, vtag="normal"):
+            ins(f"  {label:<46}", "section")
+            ins(f"{value}\n", vtag)
+
+        def bullet(text, tag="normal"):
+            ins(f"  • {text}\n", tag)
+
+        def sep():
+            ins("\n")
+
+        # ══════════════════════════════════════════════════════════════════
+        # ШАПКА
+        # ══════════════════════════════════════════════════════════════════
+        h1("ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ НА ПРОЕКТ ВЕДОМСТВЕННОГО НПА")
+        ins("  Система комплексной интеллектуальной юридической экспертизы\n", "purple")
+        ins("  Интеллектуальная правовая экспертиза нормативных правовых актов\n\n", "purple")
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ I: ОБЩАЯ ИНФОРМАЦИЯ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ I.  ОБЩАЯ ИНФОРМАЦИЯ")
+        ds = vr.get('doc_structure', {})
+        file_name = os.path.basename(self.current_file)
+        row("Наименование файла:", file_name)
+        row("Тип акта:", "Приказ ведомственный нормативный")
+        row("Орган:", "Министерство экономического развития РФ")
+        row("Дата и время проверки:", datetime.now().strftime("%d.%m.%Y  %H:%M:%S"))
+        row("Объём документа:",
+            f"{len(self.current_text):,} символов  (≈ {ds.get('estimated_pages', 1)} страниц)")
+        row("Пунктов распорядительной части:", str(ds.get('total_paragraphs', '—')))
+        row("Подпунктов:", str(ds.get('total_subparagraphs', 0)))
+        has_sig = ds.get('has_signature_block', False)
+        row("Блок подписи руководителя:",
+            "Обнаружен ✓" if has_sig else "Не обнаружен ⚠",
+            "success" if has_sig else "warning")
+        row("Приложения и разделы:",
+            "С главами" if ds.get('has_chapters') else
+            ("С разделами" if ds.get('has_sections') else "Без разделов / глав"))
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ II: СТРУКТУРНАЯ / ПРАВОВАЯ ПРОВЕРКА
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ II.  ПРАВОВАЯ ЭКСПЕРТИЗА (СТРУКТУРНАЯ ПРОВЕРКА)")
+        is_valid = vr['is_valid']
+        row("Общий статус:",
+            "✓ СТРУКТУРА ДОКУМЕНТА КОРРЕКТНА" if is_valid else "✗ ОБНАРУЖЕНЫ ОШИБКИ В СТРУКТУРЕ",
+            "success" if is_valid else "error")
+        row("Критических ошибок:", str(vr['total_errors']),
+            "success" if vr['total_errors'] == 0 else "error")
+        row("Предупреждений:", str(vr['total_warnings']),
+            "success" if vr['total_warnings'] == 0 else "warning")
+
+        if vr['errors']:
+            sep()
+            ins("  КРИТИЧЕСКИЕ ОШИБКИ:\n", "error")
+            for i, err in enumerate(vr['errors'], 1):
+                ins(f"  {i}. [{err.section}] {err.error_type}\n", "error")
+                ins(f"     {err.description}\n", "normal")
+
+        if vr['warnings']:
+            sep()
+            ins("  ПРЕДУПРЕЖДЕНИЯ:\n", "warning")
+            for i, w in enumerate(vr['warnings'], 1):
+                ins(f"  {i}. [{w.section}] {w.error_type}\n", "warning")
+                ins(f"     {w.description}\n", "normal")
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ III: АНТИКОРРУПЦИОННАЯ ЭКСПЕРТИЗА
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ III.  АНТИКОРРУПЦИОННАЯ ЭКСПЕРТИЗА")
+        ins("  (Постановление Правительства РФ от 26.02.2010 № 96, методика Минюста России)\n\n",
+            "normal")
+        ac = vr.get('anticorruption', {})
+        risk = ac.get('risk_level', 'н/д')
+        risk_tag = {"низкий": "success", "умеренный": "warning",
+                    "повышенный": "error", "высокий": "error"}.get(risk, "normal")
+        row("Уровень коррупциогенного риска:", risk.upper(), risk_tag)
+        row("Коррупциогенных факторов выявлено:", str(len(ac.get('factors', []))),
+            "success" if not ac.get('factors') else "warning")
+
+        factors = ac.get('factors', [])
+        if factors:
+            sep()
+            ins("  Выявленные коррупциогенные факторы:\n", "warning")
+            for f in factors:
+                bullet(f, "warning")
         else:
-            rt.insert(tk.END, f"  [ИТОГ]  ОБНАРУЖЕНЫ НАРУШЕНИЯ СТРУКТУРЫ  "
-                              f"(ошибок: {vr['total_errors']})\n", "error")
+            bullet("Коррупциогенные факторы не выявлены", "success")
 
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-        rt.insert(tk.END,
-                  f"  Соответствие требованиям: [{bar}] {pct}%\n",
-                  "success" if pct >= 75 else "warning" if pct >= 50 else "error")
-        rt.insert(tk.END,
-                  f"  Критических ошибок: {vr['total_errors']}   "
-                  f"Предупреждений: {vr['total_warnings']}\n\n")
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ IV: ЮРИДИКО-ТЕХНИЧЕСКАЯ ЭКСПЕРТИЗА
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ IV.  ЮРИДИКО-ТЕХНИЧЕСКАЯ ЭКСПЕРТИЗА")
+        lt = vr.get('legal_technique', {})
+        needs_rev = lt.get('requires_revision', False)
+        row("Требует редакционной доработки:",
+            "ДА — выявлены замечания" if needs_rev else "НЕТ — замечаний не выявлено",
+            "warning" if needs_rev else "success")
+        sep()
 
-        # ── чек-лист по разделам ──────────────────────────────────────────
-        rt.insert(tk.END, "=" * 80 + "\n", "header")
-        rt.insert(tk.END, "  ЧЕК-ЛИСТ ОБЯЗАТЕЛЬНЫХ ЭЛЕМЕНТОВ\n", "header")
-        rt.insert(tk.END, "=" * 80 + "\n")
-        for name, ok, frag in checks:
-            if ok:
-                rt.insert(tk.END, "  [+] ", "success")
-                rt.insert(tk.END, f"{name}\n")
-                if frag and frag not in ("нет", "нет ссылок на приложения"):
-                    rt.insert(tk.END, f"       «{frag}»\n", "section")
-            else:
-                rt.insert(tk.END, "  [-] ", "error")
-                rt.insert(tk.END, f"{name}\n")
-        rt.insert(tk.END, "\n")
+        vague = lt.get('vague_formulations', [])
+        ins("  4.1. Точность формулировок (исключение неоднозначного толкования):\n", "section")
+        row("  Неопределённых формулировок:",
+            f"Обнаружено: {len(vague)}" if vague else "Не обнаружены",
+            "warning" if vague else "success")
+        if vague:
+            for v in vague[:8]:
+                bullet(v, "warning")
+            if len(vague) > 8:
+                bullet(f"…и ещё {len(vague) - 8} формулировок", "warning")
+        sep()
 
-        # ── разбор по разделам ────────────────────────────────────────────
-        SECTION_ORDER = [
-            "Шапка документа",
-            "Заголовок",
-            "Преамбула",
-            "Распорядительная часть",
-            "Приложения",
-            "Прочие",
-        ]
-        SECTION_HELP = {
-            "Шапка документа":
-                "Должна содержать: полное наименование органа, вид документа «ПРИКАЗ»,\n"
-                "    дату (ДД.ММ.ГГГГ), регистрационный номер (№ ...), место издания (г. ...).",
-            "Заголовок":
-                "Должен кратко отражать предмет приказа, начинаться с «О» или «Об»,\n"
-                "    выноситься отдельной строкой перед преамбулой.",
-            "Преамбула":
-                "Указывает правовые основания издания приказа.\n"
-                "    Начинается: «В соответствии с», «На основании», «Во исполнение» и т.п.\n"
-                "    Должна содержать ссылку на НПА (с номером и датой).",
-            "Распорядительная часть":
-                "Начинается с отдельной строки «ПРИКАЗЫВАЮ:».\n"
-                "    Содержит нумерованные пункты с конкретными распорядительными действиями.\n"
-                "    Последний пункт — контроль за исполнением.",
-            "Приложения":
-                "Если упомянуты в тексте — должны быть оформлены отдельными блоками\n"
-                "    с реквизитами «Приложение к приказу от ... № ...».",
-            "Прочие":
-                "Антикоррупционный анализ: поиск в тексте типовых коррупциогенных формулировок НПА\n"
-                "    (усмотрение без критериев, размытые сроки, широкие отсылки и т.п.).\n"
-                "    Полный методический перечень — в сохранённом отчёте (конец файла).",
-        }
+        terms = lt.get('terminology_issues', [])
+        ins("  4.2. Соответствие терминологии законодательным определениям:\n", "section")
+        row("  Терминологических замечаний:",
+            f"{len(terms)}" if terms else "Нет замечаний",
+            "warning" if terms else "success")
+        if terms:
+            for term in terms:
+                bullet(term, "warning")
+        sep()
 
-        # группируем ошибки/предупреждения по разделу
-        from collections import defaultdict
-        err_by_sec  = defaultdict(list)
-        warn_by_sec = defaultdict(list)
-        for e in vr["errors"]:
-            err_by_sec[e.section].append(e)
-        for w in vr["warnings"]:
-            warn_by_sec[w.section].append(w)
+        struct_issues = lt.get('structure_issues', [])
+        ins("  4.3. Соблюдение правил юридической техники и норм официального документооборота:\n",
+            "section")
+        row("  Нарушений юридической техники:",
+            f"{len(struct_issues)}" if struct_issues else "Не выявлено",
+            "warning" if struct_issues else "success")
+        if struct_issues:
+            for s in struct_issues:
+                bullet(s, "warning")
+        sep()
 
-        all_sections = set(err_by_sec) | set(warn_by_sec)
-        ordered = [s for s in SECTION_ORDER if s in all_sections or s in SECTION_HELP]
+        contrad = lt.get('internal_contradictions', [])
+        ins("  4.4. Обеспечение внутренней непротиворечивости нормативного регулирования:\n",
+            "section")
+        row("  Замечаний по непротиворечивости:",
+            f"Выявлено: {len(contrad)}" if contrad else "Противоречия не выявлены",
+            "warning" if contrad else "success")
+        if contrad:
+            for c in contrad:
+                bullet(c, "warning")
 
-        corr_hits = self._scan_corruption_risks(text)
+        if needs_rev:
+            sep()
+            ins("  ⚠ Отдельные положения приказа требуют редакционной доработки в части:\n",
+                "warning")
+            for pt in [
+                "точности формулировок, исключающей возможность неоднозначного толкования;",
+                "соответствия используемой терминологии определениям, закреплённым "
+                "в законодательстве;",
+                "соблюдения правил юридической техники и норм официального документооборота;",
+                "обеспечения внутренней непротиворечивости нормативного регулирования.",
+            ]:
+                bullet(pt, "warning")
 
-        rt.insert(tk.END, "=" * 80 + "\n", "header")
-        rt.insert(tk.END, "  ДЕТАЛЬНЫЙ АНАЛИЗ ПО РАЗДЕЛАМ\n", "header")
-        rt.insert(tk.END, "=" * 80 + "\n\n")
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ V: КАЛЬКУЛЯТОР ОБЯЗАТЕЛЬНЫХ ТРЕБОВАНИЙ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ V.  ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ТРЕБОВАНИЙ")
+        ins("  (Федеральный закон № 247-ФЗ, реестр обязательных требований, "
+            "механизм «регуляторной гильотины»)\n\n", "normal")
+        mand = vr.get('mandatory', {})
+        row("Всего обязательных требований:", str(mand.get('total', 0)))
+        row("Пунктов, содержащих требования:", str(len(mand.get('by_paragraph', []))))
+        sep()
 
-        for sec in ordered:
-            if sec == "Прочие":
-                if corr_hits:
-                    marker, tag = "[ЗАМЕЧАНИЯ]", "warning"
-                else:
-                    marker, tag = "[ OK ]     ", "success"
-                rt.insert(tk.END, f"  {marker}  {sec}\n", tag)
-                rt.insert(tk.END, f"    Требования: {SECTION_HELP[sec]}\n", "section")
-                for hi in corr_hits:
-                    rt.insert(tk.END, f"    ~ Возможная коррупциогенная конструкция\n", "warning")
-                    rt.insert(tk.END, f"      «{hi['label']}» — риск: {hi['risk']}\n", "corr_note")
-                    rt.insert(tk.END, f"      Фрагмент: {hi['snippet']}\n", "normal")
-                if not corr_hits:
-                    rt.insert(tk.END, "    Типовые формулировки из перечня в тексте не обнаружены (автопоиск).\n",
-                              "success")
-                rt.insert(tk.END, "\n")
-                continue
+        by_type = mand.get('by_type', {})
+        if by_type:
+            ins("  По видам обязательных требований:\n", "section")
+            for req_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
+                row(f"    {req_type}:", str(count))
 
-            errs  = err_by_sec.get(sec, [])
-            warns = warn_by_sec.get(sec, [])
-            if errs:
-                marker, tag = "[ ОШИБКИ ]", "error"
-            elif warns:
-                marker, tag = "[ЗАМЕЧАНИЯ]", "warning"
-            else:
-                marker, tag = "[ OK ]     ", "success"
+        by_para = mand.get('by_paragraph', [])
+        if by_para:
+            sep()
+            ins("  По пунктам распорядительной части:\n", "section")
+            ins(f"  {'Пункт':<12}{'Кол-во':<10}{'Виды требований'}\n", "section")
+            ins("  " + "─" * 72 + "\n", "normal")
+            for p in by_para:
+                row(f"    п. {p['number']}",
+                    f"{p['count']}      {', '.join(p['requirements'])}")
+        else:
+            bullet("Структурированных обязательных требований по пунктам не выявлено", "warning")
 
-            rt.insert(tk.END, f"  {marker}  {sec}\n", tag)
-            if sec in SECTION_HELP:
-                rt.insert(tk.END, f"    Требования: {SECTION_HELP[sec]}\n", "section")
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ VI: ОРВ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ VI.  НЕОБХОДИМОСТЬ ПРОВЕДЕНИЯ ОЦЕНКИ РЕГУЛИРУЮЩЕГО ВОЗДЕЙСТВИЯ (ОРВ)")
+        orv = vr.get('orv', {})
+        orv_req = orv.get('required', False)
+        row("Необходимость ОРВ:",
+            orv.get('conclusion', '—'),
+            "warning" if orv_req else "success")
+        row("ОРВ присутствует в документе:",
+            "Обнаружена ✓" if orv.get('found') else "Не обнаружена",
+            "success" if orv.get('found') else "normal")
+        row("Положений, влияющих на предпринимат. деятельность:",
+            "Да — выявлены" if orv_req else "Нет",
+            "warning" if orv_req else "success")
 
-            for e in errs:
-                rt.insert(tk.END, f"    ! {e.error_type}\n", "error")
-                rt.insert(tk.END, f"      {e.description}\n")
-            for w in warns:
-                rt.insert(tk.END, f"    ~ {w.error_type}\n", "warning")
-                rt.insert(tk.END, f"      {w.description}\n")
-            rt.insert(tk.END, "\n")
+        triggers = orv.get('triggers', [])
+        if triggers:
+            sep()
+            ins("  Выявленные основания для проведения ОРВ:\n", "warning")
+            for trig in triggers:
+                bullet(trig, "warning")
 
-        # ── извлечённые фрагменты из текста ──────────────────────────────
-        rt.insert(tk.END, "=" * 80 + "\n", "header")
-        rt.insert(tk.END, "  ИЗВЛЕЧЁННЫЕ РЕКВИЗИТЫ ДОКУМЕНТА\n", "header")
-        rt.insert(tk.END, "=" * 80 + "\n")
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ VII: ОФВ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ VII.  НЕОБХОДИМОСТЬ ПРОВЕДЕНИЯ ОЦЕНКИ ФАКТИЧЕСКОГО ВОЗДЕЙСТВИЯ (ОФВ)")
+        ofv = vr.get('ofv', {})
+        ofv_req = ofv.get('required', False)
+        row("Необходимость ОФВ:",
+            ofv.get('conclusion', '—'),
+            "warning" if ofv_req else "success")
+        row("Требования с длительным сроком действия:",
+            "Да — обнаружены" if ofv.get('long_term') else "Нет",
+            "warning" if ofv.get('long_term') else "success")
+        row("Административная нагрузка субъектов регулирования:",
+            "Выявлена" if ofv.get('admin_burden') else "Не выявлена",
+            "warning" if ofv.get('admin_burden') else "success")
 
-        head20 = "\n".join(text.splitlines()[:25])
-        fragments = {
-            "Наименование органа": re.search(
-                r'(МИНИСТЕРСТВО[^\n]+|Минэкономразвития[^\n]+)', head20, re.I),
-            "Дата приказа": re.search(
-                r'(?:от\s+)?(\d{2}\.\d{2}\.\d{4}|«?\d{1,2}»?\s+[а-яё]+\s+\d{4})', text, re.I),
-            "Номер приказа": re.search(r'(№\s*[\d\w/-]+)', text),
-            "Место издания": re.search(r'(г\.\s*[А-ЯЁ][а-яё-]+)', head20),
-            "Заголовок «О ...»": re.search(
-                r'^\s*(О[бб]?\s+[А-ЯЁа-яё].{10,80})', text, re.MULTILINE),
-            "Распорядительное слово": re.search(r'(ПРИКАЗЫВАЮ\s*:?)', text, re.I),
-            "Подписант": re.search(
-                r'([Мм]инистр\s+[^\n]{5,40}|[Зз]ам\w*\s+министра[^\n]{0,30})', text),
-        }
-        for label, m in fragments.items():
-            val = m.group(1).strip()[:70] if m else "—  не найдено"
-            tag = "section" if m else "error"
-            rt.insert(tk.END, f"  {label:<28}: ", "normal")
-            rt.insert(tk.END, f"{val}\n", tag)
-        rt.insert(tk.END, "\n")
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ VIII: ФИНАНСОВО-ЭКОНОМИЧЕСКОЕ ОБОСНОВАНИЕ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ VIII.  ФИНАНСОВО-ЭКОНОМИЧЕСКОЕ ОБОСНОВАНИЕ")
+        fin = vr.get('financial', {})
+        fin_req = fin.get('required', False)
+        fin_found = fin.get('found', False)
+        row("Наличие ФЭО:",
+            fin.get('conclusion', '—'),
+            "warning" if fin_req and not fin_found else "success")
+        row("Требуются бюджетные расходы:",
+            "Да" if fin.get('budget_expenses') else "Нет")
+        row("ФЭО присутствует в тексте:",
+            "Да ✓" if fin_found else "Нет",
+            "success" if fin_found else ("warning" if fin_req else "normal"))
+        row("Наличие оценки затрат субъектов регулирования:",
+            "Обнаружена ✓" if fin.get('cost_estimate_found') else "Не обнаружена")
+        sep()
+        ins("  Влияние акта на субъекты регулирования:\n", "section")
+        row("    Организации / юридические лица:",
+            "Да" if fin.get('affects_organizations') else "Нет")
+        row("    Граждане / физические лица:",
+            "Да" if fin.get('affects_citizens') else "Нет")
+        row("    Предпринимательство / бизнес:",
+            "Да" if fin.get('affects_business') else "Нет")
+        row("    Бюджет (федеральный / региональный):",
+            "Да" if fin.get('affects_budget') else "Нет")
 
-        # ── нейронная модель ──────────────────────────────────────────────
+        if fin.get('details'):
+            sep()
+            ins("  Обнаруженные финансовые индикаторы:\n", "section")
+            for d in fin['details']:
+                bullet(d)
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ IX: СООТВЕТСТВИЕ АКТАМ БОЛЬШЕЙ ЮРИДИЧЕСКОЙ СИЛЫ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ IX.  СООТВЕТСТВИЕ АКТАМ БОЛЬШЕЙ ЮРИДИЧЕСКОЙ СИЛЫ")
+        hl = vr.get('higher_law', {})
+        sep()
+        ins("  ✓  " + hl.get('statement',
+            'Рассматриваемый ведомственный акт соответствует актам большей юридической силы.')
+            + "\n", "success")
+        sep()
+        row("  Ссылки на Конституцию Российской Федерации:",
+            "Обнаружены ✓" if hl.get('constitution_refs') else "Не обнаружены",
+            "success" if hl.get('constitution_refs') else "normal")
+
+        fl = hl.get('federal_law_refs', [])
+        row("  Ссылки на федеральные законы:",
+            f"{len(fl)} ссылок" if fl else "Не обнаружены")
+        if fl:
+            for ref in fl[:4]:
+                bullet(ref[:80] + ("…" if len(ref) > 80 else ""))
+
+        pp = hl.get('government_resolution_refs', [])
+        row("  Постановления Правительства РФ:",
+            f"{len(pp)} ссылок" if pp else "Не обнаружены")
+        if pp:
+            for ref in pp[:3]:
+                bullet(ref[:80] + ("…" if len(ref) > 80 else ""))
+
+        up = hl.get('presidential_decree_refs', [])
+        row("  Указы Президента Российской Федерации:",
+            f"{len(up)} ссылок" if up else "Не обнаружены")
+
+        if hl.get('issues'):
+            sep()
+            for issue in hl['issues']:
+                bullet(issue, "warning")
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ X: ПРОВЕРКА ПОЛНОМОЧИЙ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ X.  ПРОВЕРКА ПОЛНОМОЧИЙ ОРГАНА НА ИЗДАНИЕ АКТА")
+        auth = vr.get('authority', {})
+        row("Статус:",
+            auth.get('conclusion', '—'),
+            "success" if auth.get('authority_stated') else "warning")
+        row("Ссылка на основание полномочий:",
+            "Имеется ✓" if auth.get('authority_stated') else "Не обнаружена",
+            "success" if auth.get('authority_stated') else "warning")
+        row("Ссылка на Положение о Министерстве:",
+            "Обнаружена ✓" if auth.get('basis_found') else "Не обнаружена")
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ XI: АНАЛИЗ СРОКОВ
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ XI.  АНАЛИЗ СРОКОВ ИСПОЛНЕНИЯ")
+        dl = vr.get('deadlines', {})
+        spec = dl.get('specific', [])
+        indef = dl.get('indefinite', [])
+        row("Конкретные сроки исполнения:",
+            f"Найдено: {len(spec)}" if spec else "Не обнаружены")
+        if spec:
+            for s in spec[:4]:
+                bullet(str(s))
+        row("Неопределённые (нечёткие) сроки:",
+            f"Выявлено: {len(indef)}" if indef else "Не выявлены",
+            "warning" if indef else "success")
+        if indef:
+            for idf in indef:
+                bullet(f'«{idf}» — рекомендуется заменить конкретным сроком', "warning")
+
+        if dl.get('issues'):
+            for iss in dl['issues']:
+                bullet(iss, "warning")
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ XII: АНАЛИЗ НОРМАТИВНЫХ ССЫЛОК
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ XII.  АНАЛИЗ НОРМАТИВНЫХ ССЫЛОК")
+        refs = vr.get('references', {})
+        row("Всего нормативных ссылок:", str(refs.get('total_refs', 0)))
+        npa = refs.get('npa_refs', [])
+        if npa:
+            sep()
+            ins("  Выявленные ссылки на нормативные правовые акты:\n", "section")
+            for ref in npa[:6]:
+                bullet(ref[:82] + ("…" if len(ref) > 82 else ""))
+
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ XIII: НЕЙРОННАЯ МОДЕЛЬ (если доступна)
+        # ──────────────────────────────────────────────────────────────────
         if mr:
-            rt.insert(tk.END, "=" * 80 + "\n", "header")
-            rt.insert(tk.END, "  ОЦЕНКА НЕЙРОННОЙ МОДЕЛЬЮ (rubert-tiny2)\n", "header")
-            rt.insert(tk.END, "=" * 80 + "\n")
-            conf = mr["confidence"] * 100
-            if mr["has_errors"]:
-                rt.insert(tk.END, f"  Вердикт  : ОШИБКИ ОБНАРУЖЕНЫ  (уверенность {conf:.1f}%)\n",
-                          "error")
+            h2("РАЗДЕЛ XIII.  ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА НЕЙРОННОЙ МОДЕЛЬЮ")
+            if mr['has_errors']:
+                row("Результат модели:", "✗ Обнаружены ошибки", "error")
             else:
-                rt.insert(tk.END, f"  Вердикт  : НАРУШЕНИЙ НЕ ВЫЯВЛЕНО  (уверенность {conf:.1f}%)\n",
-                          "success")
-            no_p  = mr["probabilities"]["no_errors"]  * 100
-            has_p = mr["probabilities"]["has_errors"] * 100
-            rt.insert(tk.END, f"  P(корректен)   : {no_p:.1f}%\n")
-            rt.insert(tk.END, f"  P(есть ошибки) : {has_p:.1f}%\n")
-            if mr["pattern_errors"]:
-                rt.insert(tk.END, "\n  Ошибки по шаблонам:\n", "section")
-                for cat, errs in mr["pattern_errors"].items():
-                    rt.insert(tk.END, f"    - {cat}: {len(errs)} случаев\n")
-            rt.insert(tk.END, "\n")
+                row("Результат модели:", "✓ Ошибок не обнаружено", "success")
+            row("Уверенность модели:", f"{mr['confidence'] * 100:.1f}%")
+            if mr.get('pattern_errors'):
+                sep()
+                ins("  Ошибки по шаблонам (34 категории):\n", "section")
+                for cat, errs in mr['pattern_errors'].items():
+                    bullet(f"{cat}: {len(errs)} шт.", "warning")
 
-        # ── рекомендации ──────────────────────────────────────────────────
-        rec = []
-        for e in vr["errors"]:
-            rec.append(("ОБЯЗАТЕЛЬНО", e.section, e.error_type, e.description))
-        for w in vr["warnings"]:
-            rec.append(("ЖЕЛАТЕЛЬНО", w.section, w.error_type, w.description))
-        if mr and mr["has_errors"]:
-            rec.append(("ОБЯЗАТЕЛЬНО", "Модель", "Документ признан ошибочным",
-                        "Устраните нарушения и повторите проверку."))
-
-        if rec:
-            rt.insert(tk.END, "=" * 80 + "\n", "header")
-            rt.insert(tk.END, "  РЕКОМЕНДАЦИИ ПО УСТРАНЕНИЮ НАРУШЕНИЙ\n", "header")
-            rt.insert(tk.END, "=" * 80 + "\n")
-            oblig = [(s, t, d) for p, s, t, d in rec if p == "ОБЯЗАТЕЛЬНО"]
-            optl  = [(s, t, d) for p, s, t, d in rec if p == "ЖЕЛАТЕЛЬНО"]
-            if oblig:
-                rt.insert(tk.END, "  Критические (устранить обязательно):\n", "error")
-                for i, (s, t, d) in enumerate(oblig, 1):
-                    rt.insert(tk.END, f"  {i}. [{s}] {t}\n", "error")
-                    rt.insert(tk.END, f"     {d}\n")
-                rt.insert(tk.END, "\n")
-            if optl:
-                rt.insert(tk.END, "  Рекомендуемые улучшения:\n", "warning")
-                for i, (s, t, d) in enumerate(optl, 1):
-                    rt.insert(tk.END, f"  {i}. [{s}] {t}\n", "warning")
-                    rt.insert(tk.END, f"     {d}\n")
-            rt.insert(tk.END, "\n")
-
-        # ── финал ─────────────────────────────────────────────────────────
-        rt.insert(tk.END, "=" * 80 + "\n", "header")
-        conclusion = (
-            "ЗАКЛЮЧЕНИЕ: документ соответствует требованиям оформления приказов МЭР."
-            if vr["is_valid"] and pct >= 75 else
-            "ЗАКЛЮЧЕНИЕ: документ требует доработки перед направлением на согласование."
+        # ──────────────────────────────────────────────────────────────────
+        # РАЗДЕЛ XIV: ОБЩИЙ ВЫВОД
+        # ──────────────────────────────────────────────────────────────────
+        h2("РАЗДЕЛ XIV.  ОБЩИЙ ВЫВОД И РЕКОМЕНДАЦИИ")
+        total_issues = (
+            vr['total_errors'] +
+            len(ac.get('factors', [])) +
+            len(lt.get('vague_formulations', [])) +
+            (1 if orv_req else 0) +
+            (1 if fin_req and not fin_found else 0)
         )
-        rt.insert(tk.END, f"  {conclusion}\n",
-                  "success" if vr["is_valid"] and pct >= 75 else "error")
-        rt.insert(tk.END, "=" * 80 + "\n")
+        sep()
+        if total_issues == 0:
+            ins("  ✓ По результатам комплексной экспертизы проект приказа соответствует\n"
+                "    требованиям нормотворческой техники и может быть рекомендован к подписанию.\n",
+                "success")
+        elif total_issues <= 4:
+            ins("  ⚠ Проект приказа в целом соответствует требованиям, однако требует\n"
+                "    устранения выявленных замечаний до направления на подписание.\n", "warning")
+        else:
+            ins("  ✗ Проект приказа требует существенной доработки.\n"
+                "    Рекомендуется устранить все критические замечания и провести повторную экспертизу.\n",
+                "error")
+
+        row("\n  Всего выявлено замечаний (сводно):", str(total_issues))
+        sep()
+        ins("  Рекомендации по доработке:\n", "section")
+        if vr['errors']:
+            bullet("Устранить все критические структурные ошибки", "error")
+        if factors:
+            bullet("Исключить коррупциогенные формулировки согласно методике Минюста", "warning")
+        if vague:
+            bullet("Заменить нечёткие формулировки конкретными нормами", "warning")
+        if orv_req:
+            bullet("Провести оценку регулирующего воздействия (ОРВ)", "warning")
+        if fin_req and not fin_found:
+            bullet("Подготовить финансово-экономическое обоснование (ФЭО)", "warning")
+        if indef:
+            bullet("Заменить неопределённые сроки конкретными датами/периодами", "warning")
+        if not auth.get('authority_stated'):
+            bullet("Указать нормативное основание полномочий органа на издание акта", "warning")
+
+        # ══════════════════════════════════════════════════════════════════
+        # СТРАНИЦА 2: ТЕКСТ ПРИКАЗА С ПОДСВЕТКОЙ ПРАВОТВОРЧЕСКИХ ОШИБОК
+        # ══════════════════════════════════════════════════════════════════
+        ins("\n\n")
+        h1("СТРАНИЦА 2.  ТЕКСТ ПРОЕКТА ПРИКАЗА С АННОТАЦИЕЙ ПРАВОТВОРЧЕСКИХ ОШИБОК")
+
+        ins("  Условные обозначения подсветки:\n", "section")
+        ins("  ▌ Жёлтый фон   ", "hl_vague")
+        ins("— неопределённые / нечёткие формулировки\n", "normal")
+        ins("  ▌ Красный фон  ", "hl_corrupt")
+        ins("— коррупциогенные конструкции\n", "normal")
+        ins("  ▌ Синий фон    ", "hl_structure")
+        ins("— структурные нарушения юридической техники\n\n", "normal")
+        ins("─" * 80 + "\n", "normal")
+
+        highlighted = vr.get('highlighted', [])
+        self._insert_highlighted_text(self.current_text, highlighted)
+
+        # Сводная таблица
+        if highlighted:
+            ins("\n\n" + "─" * 80 + "\n", "normal")
+            ins("СВОДНАЯ ТАБЛИЦА ВЫЯВЛЕННЫХ ПРАВОТВОРЧЕСКИХ ОШИБОК\n", "section")
+            ins("─" * 80 + "\n\n", "normal")
+            ins(f"  {'№':<6}{'Пункт':<12}{'Тип ошибки':<18}{'Описание'}\n", "section")
+            ins("  " + "─" * 74 + "\n", "normal")
+
+            type_map = {
+                'vague':     'Нечёткость',
+                'corrupt':   'Коррупциог.',
+                'structure': 'Структура',
+            }
+            tag_map = {
+                'vague':     'hl_vague',
+                'corrupt':   'hl_corrupt',
+                'structure': 'hl_structure',
+            }
+            for i, issue in enumerate(highlighted, 1):
+                type_name = type_map.get(issue['type'], issue['type'])
+                tag = tag_map.get(issue['type'], 'normal')
+                desc = issue['description']
+                if len(desc) > 58:
+                    desc = desc[:55] + "…"
+                ins(f"  {i:<6}п.{issue['paragraph']:<10}{type_name:<18}{desc}\n", tag)
+
+            sep()
+            ins(f"  Итого правотворческих ошибок в тексте: {len(highlighted)}\n", "warning")
+
+        # ══════════════════════════════════════════════════════════════════
+        # ФИНАЛЬНАЯ СТРОКА
+        # ══════════════════════════════════════════════════════════════════
+        ins("\n")
+        h1("ПРОВЕРКА ЗАВЕРШЕНА")
+        ins("  Министерство экономического развития Российской Федерации\n", "section")
+        ins("  Система интеллектуальной юридической экспертизы НПА\n", "section")
+        ins("═" * 80 + "\n", "header")
+
+    def _insert_highlighted_text(self, text: str, highlighted_issues: list):
+        """Вставляет текст с цветовой подсветкой проблемных мест"""
+        priority = {'corrupt': 0, 'vague': 1, 'structure': 2}
+        sorted_issues = sorted(
+            highlighted_issues,
+            key=lambda x: (x['start'], priority.get(x['type'], 9))
+        )
+
+        # Удаляем перекрывающиеся диапазоны
+        clean = []
+        last_end = 0
+        for issue in sorted_issues:
+            if issue['start'] >= last_end:
+                clean.append(issue)
+                last_end = issue['end']
+
+        tag_map = {
+            'vague':     'hl_vague',
+            'corrupt':   'hl_corrupt',
+            'structure': 'hl_structure',
+        }
+
+        pos = 0
+        for issue in clean:
+            if issue['start'] > pos:
+                self.result_text.insert(tk.END, text[pos:issue['start']], "normal")
+            tag = tag_map.get(issue['type'], 'normal')
+            self.result_text.insert(tk.END, text[issue['start']:issue['end']], tag)
+            pos = issue['end']
+
+        if pos < len(text):
+            self.result_text.insert(tk.END, text[pos:], "normal")
 
     # ----------------------------------------------------------------- report
     def save_report(self):
@@ -1100,224 +1413,375 @@ class OrderCheckerGUI:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при сохранении:\n{e}")
 
-    def _generate_report(self):
-        import re
-        vr   = self.last_validation_result
-        mr   = self.last_model_result
-        text = self.current_text
-        st   = self._doc_stats(text)
-        checks = self._quick_scan(text)
-        found  = sum(1 for _, ok, _ in checks if ok)
-        total  = len(checks)
-        pct    = found * 100 // total
-        now    = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        bar    = "#" * (pct // 5) + "." * (20 - pct // 5)
+    def _generate_report(self) -> str:
+        """Генерирует полное экспертное заключение в текстовом формате (14 разделов)"""
+        vr = self.last_validation_result
+        mr = self.last_model_result
+        now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        ds = vr.get('doc_structure', {})
+        file_name = os.path.basename(self.current_file)
 
-        L = []
-        def h(s=""):  L.append(s)
-        def hr(): L.append("=" * 80)
-        def sr(): L.append("-" * 60)
+        R = []
 
-        hr(); h("  ОФИЦИАЛЬНЫЙ ОТЧЁТ О ПРОВЕРКЕ СТРУКТУРЫ ПРИКАЗА МЭР")
-        h("  Министерство экономического развития Российской Федерации")
-        hr(); h()
-        h(f"  Дата проверки  : {now}")
-        h(f"  Файл           : {os.path.basename(self.current_file)}")
-        h(f"  Символов       : {st['chars']:,}   Слов: {st['words']:,}   "
-          f"Строк: {st['lines']}   Абзацев: {st['paras']}")
-        h()
+        def hr1(text=""):
+            R.append("═" * 80)
+            if text:
+                R.append(f"  {text}")
+                R.append("═" * 80)
 
-        # итог
-        hr()
-        h("  СВОДНОЕ ЗАКЛЮЧЕНИЕ")
-        hr()
-        verdict = ("СТРУКТУРА СООТВЕТСТВУЕТ ТРЕБОВАНИЯМ" if vr["is_valid"] and pct >= 75
-                   else "ОБНАРУЖЕНЫ НАРУШЕНИЯ СТРУКТУРЫ ДОКУМЕНТА")
-        h(f"  Вердикт        : {verdict}")
-        h(f"  Соответствие   : [{bar}] {pct}% ({found}/{total} элементов в норме)")
-        h(f"  Критических ошибок : {vr['total_errors']}")
-        h(f"  Предупреждений     : {vr['total_warnings']}")
-        h()
-        h("  + В отчёт включён раздел «Прочие»: краткий итог — в «Детальном анализе по разделам»;")
-        h("    полный методический перечень и повтор результатов поиска — перед итоговым заключением.")
-        h()
+        def hr2(text):
+            R.append("")
+            R.append(text)
+            R.append("─" * 80)
 
-        # чек-лист
-        hr(); h("  ЧЕК-ЛИСТ ОБЯЗАТЕЛЬНЫХ ЭЛЕМЕНТОВ ПРИКАЗА"); hr()
-        for name, ok, frag in checks:
-            mark = "[+]" if ok else "[-]"
-            h(f"  {mark}  {name}")
-            if ok and frag and frag not in ("нет", "нет ссылок на приложения"):
-                h(f"        > {frag}")
-        h()
+        def row(label, value):
+            R.append(f"  {label:<46}{value}")
 
-        # реквизиты
-        hr(); h("  ИЗВЛЕЧЁННЫЕ РЕКВИЗИТЫ ДОКУМЕНТА"); hr()
-        head20 = "\n".join(text.splitlines()[:25])
-        fragments = {
-            "Наименование органа": re.search(
-                r'(МИНИСТЕРСТВО[^\n]+|Минэкономразвития[^\n]+)', head20, re.I),
-            "Дата приказа": re.search(
-                r'(?:от\s+)?(\d{2}\.\d{2}\.\d{4}|«?\d{1,2}»?\s+[а-яё]+\s+\d{4})', text, re.I),
-            "Номер приказа": re.search(r'(№\s*[\d\w/-]+)', text),
-            "Место издания": re.search(r'(г\.\s*[А-ЯЁ][а-яё-]+)', head20),
-            "Заголовок":     re.search(r'^\s*(О[бб]?\s+[А-ЯЁа-яё].{10,80})',
-                                        text, re.MULTILINE),
-            "Распорядительное слово": re.search(r'(ПРИКАЗЫВАЮ\s*:?)', text, re.I),
-            "Подписант": re.search(
-                r'([Мм]инистр\s+[^\n]{5,40}|[Зз]ам\w*\s+министра[^\n]{0,30})', text),
-        }
-        for label, m in fragments.items():
-            val = m.group(1).strip()[:70] if m else "— не найдено"
-            h(f"  {label:<26}: {val}")
-        h()
+        def bullet(text):
+            R.append(f"  • {text}")
 
-        # детали по разделам
-        hr(); h("  ДЕТАЛЬНЫЙ АНАЛИЗ ПО РАЗДЕЛАМ"); hr()
-        h("  Порядок: шапка документа, заголовок, преамбула, распорядительная часть,")
-        h("           приложения, затем раздел ПРОЧИЕ (антикоррупционный анализ текста).")
-        h()
-        SECTION_ORDER = ["Шапка документа", "Заголовок", "Преамбула",
-                         "Распорядительная часть", "Приложения", "Прочие"]
-        from collections import defaultdict
-        eb = defaultdict(list); wb = defaultdict(list)
-        for e in vr["errors"]:   eb[e.section].append(e)
-        for w in vr["warnings"]: wb[w.section].append(w)
+        def sep():
+            R.append("")
 
-        HELP = {
-            "Шапка документа":
-                "Наименование органа, ПРИКАЗ, дата, номер, место издания.",
-            "Заголовок":
-                "Начинается с «О» / «Об», краткий предмет приказа.",
-            "Преамбула":
-                "«В соответствии с ...», «На основании ...» + ссылка на НПА.",
-            "Распорядительная часть":
-                "«ПРИКАЗЫВАЮ:» + нумерованные пункты + пункт о контроле.",
-            "Приложения":
-                "Реквизиты «Приложение к приказу от ... № ...».",
-            "Прочие":
-                "Антикоррупционный анализ типовых формулировок НПА (автопоиск по тексту).",
-        }
-        corr_hits_rep = self._scan_corruption_risks(text)
-        for sec in SECTION_ORDER:
-            if sec == "Прочие":
-                status = "ЗАМЕЧАНИЯ" if corr_hits_rep else "OK"
-                h(f"  [{status:<9}]  {sec}")
-                h(f"    Требования: {HELP[sec]}")
-                for hi in corr_hits_rep:
-                    h("    ~ Возможная коррупциогенная конструкция")
-                    h(f"      «{hi['label']}» — риск: {hi['risk']}")
-                    h(f"      Фрагмент: {hi['snippet']}")
-                if not corr_hits_rep:
-                    h("    Типовые формулировки из перечня в тексте не обнаружены (автопоиск).")
-                h()
-                continue
-            errs = eb.get(sec, []); warns = wb.get(sec, [])
-            status = "ОШИБКИ" if errs else ("ЗАМЕЧАНИЯ" if warns else "OK")
-            h(f"  [{status:<9}]  {sec}")
-            if sec in HELP: h(f"    Требования: {HELP[sec]}")
-            for e in errs:   h(f"    ! {e.error_type}\n      {e.description}")
-            for w in warns:  h(f"    ~ {w.error_type}\n      {w.description}")
-            if not errs and not warns: h("    Нарушений не выявлено.")
-            h()
+        # ══ ШАПКА ════════════════════════════════════════════════════════
+        hr1("ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ НА ПРОЕКТ ВЕДОМСТВЕННОГО")
+        R.append("  НОРМАТИВНОГО ПРАВОВОГО АКТА (ПРИКАЗА)")
+        hr1()
+        R.append("  Система комплексной интеллектуальной юридической экспертизы")
+        R.append("  LegalTech / GovTech — автоматизированная экспертиза НПА")
+        sep()
 
-        # нейронная модель
-        if mr:
-            hr(); h("  ОЦЕНКА НЕЙРОННОЙ МОДЕЛЬЮ (rubert-tiny2)"); hr()
-            conf = mr["confidence"] * 100
-            v2 = "ОШИБКИ ОБНАРУЖЕНЫ" if mr["has_errors"] else "НАРУШЕНИЙ НЕ ВЫЯВЛЕНО"
-            h(f"  Вердикт модели  : {v2}  (уверенность {conf:.1f}%)")
-            h(f"  P(корректен)    : {mr['probabilities']['no_errors']*100:.1f}%")
-            h(f"  P(есть ошибки)  : {mr['probabilities']['has_errors']*100:.1f}%")
-            if mr["pattern_errors"]:
-                h("  Ошибки по шаблонам:")
-                for cat, errs in mr["pattern_errors"].items():
-                    h(f"    - {cat}: {len(errs)} случаев")
-            h()
+        # ══ РАЗДЕЛ I ═════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ I.  ОБЩАЯ ИНФОРМАЦИЯ")
+        row("Наименование файла:", file_name)
+        row("Тип акта:", "Приказ ведомственный нормативный")
+        row("Орган:", "Министерство экономического развития РФ")
+        row("Дата и время проверки:", now)
+        row("Объём документа:",
+            f"{len(self.current_text):,} символов (≈{ds.get('estimated_pages', 1)} стр.)")
+        row("Пунктов распорядительной части:", str(ds.get('total_paragraphs', '—')))
+        row("Подпунктов:", str(ds.get('total_subparagraphs', 0)))
+        row("Блок подписи:", "Обнаружен" if ds.get('has_signature_block') else "Не обнаружен")
 
-        # рекомендации
-        all_rec = ([(True,  e.section, e.error_type, e.description) for e in vr["errors"]] +
-                   [(False, w.section, w.error_type, w.description) for w in vr["warnings"]])
-        if all_rec:
-            hr(); h("  РЕКОМЕНДАЦИИ ПО УСТРАНЕНИЮ НАРУШЕНИЙ"); hr()
-            crit = [(s,t,d) for critical,s,t,d in all_rec if critical]
-            opts = [(s,t,d) for critical,s,t,d in all_rec if not critical]
-            if crit:
-                h("  Обязательные меры:")
-                for i,(s,t,d) in enumerate(crit,1):
-                    h(f"  {i}. [{s}] {t}"); h(f"     {d}")
-                h()
-            if opts:
-                h("  Рекомендуемые улучшения:")
-                for i,(s,t,d) in enumerate(opts,1):
-                    h(f"  {i}. [{s}] {t}"); h(f"     {d}")
-            h()
+        # ══ РАЗДЕЛ II ════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ II.  ПРАВОВАЯ ЭКСПЕРТИЗА (СТРУКТУРНАЯ ПРОВЕРКА)")
+        is_valid = vr['is_valid']
+        row("Общий статус:",
+            "✓ СТРУКТУРА КОРРЕКТНА" if is_valid else "✗ ОБНАРУЖЕНЫ ОШИБКИ")
+        row("Критических ошибок:", str(vr['total_errors']))
+        row("Предупреждений:", str(vr['total_warnings']))
 
-        try:
-            for line in self._corruption_report_lines(text):
-                h(line)
-        except Exception as ex:
-            hr()
-            h("  Ошибка при добавлении полного приложения «Прочие» в отчёт:")
-            h(f"    {ex}")
-            h("  Краткий раздел «Прочие» должен быть выше — в «Детальном анализе по разделам».")
-            hr()
+        if vr['errors']:
+            sep()
+            R.append("  КРИТИЧЕСКИЕ ОШИБКИ:")
+            for i, err in enumerate(vr['errors'], 1):
+                R.append(f"  {i}. [{err.section}] {err.error_type}")
+                R.append(f"     {err.description}")
 
-        hr()
-        h("  ИТОГОВОЕ ЗАКЛЮЧЕНИЕ")
-        h("  " + ("Документ соответствует требованиям оформления приказов МЭР."
-                  if vr["is_valid"] and pct >= 75 else
-                  "Документ требует доработки перед направлением на согласование."))
-        hr()
-        h("  Подготовлено автоматической системой проверки приказов МЭР")
-        h(f"  Дата: {now}")
-        hr()
-        out = "\n".join(L)
-        if "Прочие" not in out:
-            out += (
-                "\n\n"
-                + "=" * 80
-                + "\n  ВНИМАНИЕ: в отчёте отсутствует раздел «Прочие» (ошибка сборки). "
-                "Обновите программу до последней версии gui_app.py.\n"
-                + "=" * 80
-            )
-        return out
+        if vr['warnings']:
+            sep()
+            R.append("  ПРЕДУПРЕЖДЕНИЯ:")
+            for i, w in enumerate(vr['warnings'], 1):
+                R.append(f"  {i}. [{w.section}] {w.error_type}")
+                R.append(f"     {w.description}")
 
-    def _corruption_report_lines(self, text: str):
-        """Строки раздела «Прочие» для текстового отчёта (единая сборка)."""
-        lines = []
-        sep = "=" * 80
-        dash = "-" * 60
-
-        lines.append("")
-        lines.append(sep)
-        lines.append("  РАЗДЕЛ «ПРОЧИЕ» — АНТИКОРРУПЦИОННЫЙ АНАЛИЗ ФОРМУЛИРОВОК НПА")
-        lines.append(sep)
-        lines.append("")
-        lines.append("  Ниже — методический ориентир и результат автоматического поиска в тексте документа.")
-        lines.append("  Поиск не заменяет экспертизу; возможны ложные срабатывания.")
-        lines.append("")
-        for ref_line in CORRUPTION_REFERENCE_TEXT.splitlines():
-            lines.append("  " + ref_line if ref_line.strip() else "")
-        lines.append("")
-        lines.append(dash)
-        lines.append("  Результат поиска в тексте (категория «Прочие»)")
-        lines.append(dash)
-        corr_hits = self._scan_corruption_risks(text)
-        if corr_hits:
-            lines.append(f"  Обнаружено возможных совпадений: {len(corr_hits)}.")
-            lines.append("  Рекомендуется ручная проверка контекста.")
-            lines.append("")
-            for i, item in enumerate(corr_hits, 1):
-                lines.append(f"  {i}. «{item['label']}»")
-                lines.append(f"     Риск: {item['risk']}")
-                lines.append(f"     Фрагмент: {item['snippet']}")
-                lines.append("")
+        # ══ РАЗДЕЛ III ═══════════════════════════════════════════════════
+        hr2("РАЗДЕЛ III.  АНТИКОРРУПЦИОННАЯ ЭКСПЕРТИЗА")
+        R.append("  (Постановление Правительства РФ от 26.02.2010 № 96, методика Минюста)")
+        sep()
+        ac = vr.get('anticorruption', {})
+        risk = ac.get('risk_level', 'н/д')
+        row("Уровень коррупциогенного риска:", risk.upper())
+        row("Коррупциогенных факторов:", str(len(ac.get('factors', []))))
+        factors = ac.get('factors', [])
+        if factors:
+            sep()
+            R.append("  Выявленные коррупциогенные факторы:")
+            for f in factors:
+                bullet(f)
         else:
-            lines.append("  Типовые конструкции из перечня в тексте не обнаружены (по правилам автоматического поиска).")
-            lines.append("  Иные размытые формулировки возможны — при необходимости проведите антикоррупционную экспертизу.")
-            lines.append("")
-        return lines
+            bullet("Коррупциогенные факторы не выявлены")
+
+        # ══ РАЗДЕЛ IV ════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ IV.  ЮРИДИКО-ТЕХНИЧЕСКАЯ ЭКСПЕРТИЗА")
+        lt = vr.get('legal_technique', {})
+        needs_rev = lt.get('requires_revision', False)
+        row("Требует доработки:", "ДА" if needs_rev else "НЕТ")
+        sep()
+
+        R.append("  4.1. Точность формулировок:")
+        vague = lt.get('vague_formulations', [])
+        row("  Неопределённых формулировок:",
+            f"{len(vague)}" if vague else "Не обнаружено")
+        for v in vague[:10]:
+            bullet(v)
+
+        sep()
+        R.append("  4.2. Соответствие терминологии законодательным определениям:")
+        terms = lt.get('terminology_issues', [])
+        row("  Терминологических замечаний:", f"{len(terms)}" if terms else "Нет")
+        for term in terms:
+            bullet(term)
+
+        sep()
+        R.append("  4.3. Правила юридической техники и официального документооборота:")
+        struct_issues = lt.get('structure_issues', [])
+        row("  Нарушений:", f"{len(struct_issues)}" if struct_issues else "Не выявлено")
+        for s in struct_issues:
+            bullet(s)
+
+        sep()
+        R.append("  4.4. Внутренняя непротиворечивость нормативного регулирования:")
+        contrad = lt.get('internal_contradictions', [])
+        row("  Замечаний:", f"{len(contrad)}" if contrad else "Противоречия не выявлены")
+        for c in contrad:
+            bullet(c)
+
+        if needs_rev:
+            sep()
+            R.append("  ⚠ Отдельные положения приказа требуют редакционной доработки в части:")
+            for pt in [
+                "  — точности формулировок, исключающей неоднозначное толкование;",
+                "  — соответствия терминологии определениям, закреплённым в законодательстве;",
+                "  — соблюдения правил юридической техники и норм официального документооборота;",
+                "  — обеспечения внутренней непротиворечивости нормативного регулирования.",
+            ]:
+                R.append(pt)
+
+        # ══ РАЗДЕЛ V ═════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ V.  ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ТРЕБОВАНИЙ")
+        R.append("  (ФЗ № 247-ФЗ, реестр обязательных требований, «регуляторная гильотина»)")
+        sep()
+        mand = vr.get('mandatory', {})
+        row("Всего обязательных требований:", str(mand.get('total', 0)))
+        row("Пунктов с требованиями:", str(len(mand.get('by_paragraph', []))))
+
+        by_type = mand.get('by_type', {})
+        if by_type:
+            sep()
+            R.append("  По видам обязательных требований:")
+            for req_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
+                row(f"    {req_type}:", str(count))
+
+        by_para = mand.get('by_paragraph', [])
+        if by_para:
+            sep()
+            R.append("  По пунктам распорядительной части:")
+            R.append(f"  {'Пункт':<12}{'Кол-во':<10}{'Виды требований'}")
+            R.append("  " + "─" * 65)
+            for p in by_para:
+                row(f"    п. {p['number']}", f"{p['count']}    {', '.join(p['requirements'])}")
+
+        # ══ РАЗДЕЛ VI ════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ VI.  НЕОБХОДИМОСТЬ ПРОВЕДЕНИЯ ОРВ")
+        orv = vr.get('orv', {})
+        orv_req = orv.get('required', False)
+        row("Необходимость ОРВ:", orv.get('conclusion', '—'))
+        row("ОРВ в документе:", "Обнаружена" if orv.get('found') else "Не обнаружена")
+        row("Положения, влияющие на бизнес:", "Да" if orv_req else "Нет")
+        if orv.get('triggers'):
+            sep()
+            R.append("  Основания для ОРВ:")
+            for trig in orv['triggers']:
+                bullet(trig)
+
+        # ══ РАЗДЕЛ VII ═══════════════════════════════════════════════════
+        hr2("РАЗДЕЛ VII.  НЕОБХОДИМОСТЬ ПРОВЕДЕНИЯ ОФВ")
+        ofv = vr.get('ofv', {})
+        row("Необходимость ОФВ:", ofv.get('conclusion', '—'))
+        row("Долгосрочные требования:", "Да" if ofv.get('long_term') else "Нет")
+        row("Административная нагрузка:", "Выявлена" if ofv.get('admin_burden') else "Не выявлена")
+
+        # ══ РАЗДЕЛ VIII ══════════════════════════════════════════════════
+        hr2("РАЗДЕЛ VIII.  ФИНАНСОВО-ЭКОНОМИЧЕСКОЕ ОБОСНОВАНИЕ")
+        fin = vr.get('financial', {})
+        row("Наличие ФЭО:", fin.get('conclusion', '—'))
+        row("Бюджетные расходы:", "Требуются" if fin.get('budget_expenses') else "Не требуются")
+        row("ФЭО в тексте:", "Да" if fin.get('found') else "Нет")
+        row("Оценка затрат субъектов:", "Обнаружена" if fin.get('cost_estimate_found') else "Нет")
+        sep()
+        row("  Влияние на организации:", "Да" if fin.get('affects_organizations') else "Нет")
+        row("  Влияние на граждан:", "Да" if fin.get('affects_citizens') else "Нет")
+        row("  Влияние на бизнес:", "Да" if fin.get('affects_business') else "Нет")
+        row("  Влияние на бюджет:", "Да" if fin.get('affects_budget') else "Нет")
+
+        # ══ РАЗДЕЛ IX ════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ IX.  СООТВЕТСТВИЕ АКТАМ БОЛЬШЕЙ ЮРИДИЧЕСКОЙ СИЛЫ")
+        hl = vr.get('higher_law', {})
+        sep()
+        R.append("  ✓  " + hl.get('statement',
+            'Рассматриваемый ведомственный акт соответствует актам большей юридической силы.'))
+        sep()
+        row("  Конституция РФ:", "Ссылки обнаружены" if hl.get('constitution_refs') else "Нет")
+        fl = hl.get('federal_law_refs', [])
+        row("  Федеральные законы:", f"{len(fl)} ссылок" if fl else "Не обнаружены")
+        for ref in fl[:4]:
+            bullet(ref[:85])
+        pp = hl.get('government_resolution_refs', [])
+        row("  Постановления Правительства:", f"{len(pp)} ссылок" if pp else "Нет")
+        up = hl.get('presidential_decree_refs', [])
+        row("  Указы Президента:", f"{len(up)} ссылок" if up else "Нет")
+        if hl.get('issues'):
+            sep()
+            for issue in hl['issues']:
+                bullet(issue)
+
+        # ══ РАЗДЕЛ X ═════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ X.  ПРОВЕРКА ПОЛНОМОЧИЙ ОРГАНА")
+        auth = vr.get('authority', {})
+        row("Статус:", auth.get('conclusion', '—'))
+        row("Основание полномочий:", "Указано" if auth.get('authority_stated') else "Не указано")
+        row("Положение о Министерстве:", "Обнаружено" if auth.get('basis_found') else "Нет")
+
+        # ══ РАЗДЕЛ XI ════════════════════════════════════════════════════
+        hr2("РАЗДЕЛ XI.  АНАЛИЗ СРОКОВ ИСПОЛНЕНИЯ")
+        dl = vr.get('deadlines', {})
+        spec = dl.get('specific', [])
+        indef = dl.get('indefinite', [])
+        row("Конкретные сроки:", f"{len(spec)}" if spec else "Не обнаружены")
+        for s in spec[:4]:
+            bullet(str(s))
+        row("Неопределённые сроки:", f"{len(indef)}" if indef else "Не выявлены")
+        for idf in indef:
+            bullet(f'«{idf}» — заменить конкретным сроком')
+
+        # ══ РАЗДЕЛ XII ═══════════════════════════════════════════════════
+        hr2("РАЗДЕЛ XII.  АНАЛИЗ НОРМАТИВНЫХ ССЫЛОК")
+        refs = vr.get('references', {})
+        row("Всего нормативных ссылок:", str(refs.get('total_refs', 0)))
+        npa = refs.get('npa_refs', [])
+        if npa:
+            sep()
+            R.append("  Выявленные ссылки на НПА:")
+            for ref in npa[:6]:
+                bullet(ref[:85])
+
+        # ══ РАЗДЕЛ XIII: Модель ══════════════════════════════════════════
+        if mr:
+            hr2("РАЗДЕЛ XIII.  ПРОВЕРКА НЕЙРОННОЙ МОДЕЛЬЮ")
+            row("Результат:", "✗ Ошибки обнаружены" if mr['has_errors'] else "✓ Ошибок нет")
+            row("Уверенность:", f"{mr['confidence'] * 100:.1f}%")
+            if mr.get('pattern_errors'):
+                sep()
+                R.append("  Ошибки по шаблонам:")
+                for cat, errs in mr['pattern_errors'].items():
+                    bullet(f"{cat}: {len(errs)} шт.")
+
+        # ══ РАЗДЕЛ XIV: ВЫВОД ════════════════════════════════════════════
+        hr2("РАЗДЕЛ XIV.  ОБЩИЙ ВЫВОД И РЕКОМЕНДАЦИИ")
+        total_issues = (
+            vr['total_errors'] +
+            len(ac.get('factors', [])) +
+            len(lt.get('vague_formulations', [])) +
+            (1 if orv_req else 0) +
+            (1 if fin.get('required') and not fin.get('found') else 0)
+        )
+        sep()
+        if total_issues == 0:
+            R.append("  ✓ По результатам комплексной экспертизы проект приказа соответствует")
+            R.append("    требованиям нормотворческой техники и может быть рекомендован к подписанию.")
+        elif total_issues <= 4:
+            R.append("  ⚠ Проект приказа в целом соответствует требованиям, однако требует")
+            R.append("    устранения выявленных замечаний до направления на подписание.")
+        else:
+            R.append("  ✗ Проект приказа требует существенной доработки.")
+            R.append("    Рекомендуется устранить замечания и провести повторную экспертизу.")
+
+        row("\n  Всего выявлено замечаний (сводно):", str(total_issues))
+        sep()
+        R.append("  Рекомендации:")
+        if vr['errors']:
+            bullet("Устранить критические структурные ошибки")
+        if factors:
+            bullet("Исключить коррупциогенные формулировки (методика Минюста)")
+        if vague:
+            bullet("Заменить нечёткие формулировки конкретными нормами")
+        if orv_req:
+            bullet("Провести оценку регулирующего воздействия (ОРВ)")
+        if fin.get('required') and not fin.get('found'):
+            bullet("Подготовить финансово-экономическое обоснование (ФЭО)")
+        if indef:
+            bullet("Заменить неопределённые сроки конкретными датами/периодами")
+        if not auth.get('authority_stated'):
+            bullet("Указать нормативное основание полномочий органа")
+        if not (vr['errors'] or factors or vague or orv_req):
+            bullet("Замечаний не выявлено — документ готов к подписанию")
+
+        # ══════════════════════════════════════════════════════════════════
+        # СТРАНИЦА 2: ТЕКСТ С АННОТАЦИЕЙ ОШИБОК
+        # ══════════════════════════════════════════════════════════════════
+        R.append("")
+        hr1()
+        R.append("  СТРАНИЦА 2.  ТЕКСТ ПРОЕКТА ПРИКАЗА")
+        R.append("  С АННОТАЦИЕЙ ПРАВОТВОРЧЕСКИХ ОШИБОК")
+        hr1()
+        R.append("")
+        R.append("  Условные обозначения:")
+        R.append("  [НЕЧЁТКОСТЬ]     — неопределённая / нечёткая формулировка")
+        R.append("  [КОРРУПЦИОГЕН.]  — коррупциогенная конструкция")
+        R.append("  [СТРУКТУРА]      — нарушение юридической техники")
+        R.append("")
+        R.append("─" * 80)
+        R.append("")
+
+        highlighted = vr.get('highlighted', [])
+        type_prefix = {
+            'vague':     '⚠[НЕЧЁТКОСТЬ]',
+            'corrupt':   '⛔[КОРРУПЦИОГЕН.]',
+            'structure': '◆[СТРУКТУРА]',
+        }
+
+        if not highlighted:
+            R.append(self.current_text)
+        else:
+            priority = {'corrupt': 0, 'vague': 1, 'structure': 2}
+            sorted_issues = sorted(
+                highlighted,
+                key=lambda x: (x['start'], priority.get(x['type'], 9))
+            )
+            clean = []
+            last_end = 0
+            for issue in sorted_issues:
+                if issue['start'] >= last_end:
+                    clean.append(issue)
+                    last_end = issue['end']
+
+            pos = 0
+            for issue in clean:
+                if issue['start'] > pos:
+                    R.append(self.current_text[pos:issue['start']])
+                matched = self.current_text[issue['start']:issue['end']]
+                prefix = type_prefix.get(issue['type'], '⚠')
+                R.append(matched)
+                R.append(f"    {prefix} {issue['description']}")
+                pos = issue['end']
+            if pos < len(self.current_text):
+                R.append(self.current_text[pos:])
+
+        if highlighted:
+            R.append("")
+            R.append("─" * 80)
+            R.append("СВОДНАЯ ТАБЛИЦА ВЫЯВЛЕННЫХ ПРАВОТВОРЧЕСКИХ ОШИБОК")
+            R.append("─" * 80)
+            R.append(f"  {'№':<6}{'Пункт':<12}{'Тип':<18}{'Фрагмент / Описание'}")
+            R.append("  " + "─" * 72)
+            for i, issue in enumerate(highlighted, 1):
+                type_name = type_prefix.get(issue['type'], '?')[:14]
+                desc = issue['description']
+                if len(desc) > 50:
+                    desc = desc[:47] + "…"
+                R.append(f"  {i:<6}п.{issue['paragraph']:<10}{type_name:<18}{desc}")
+            R.append("")
+            R.append(f"  Итого правотворческих ошибок: {len(highlighted)}")
+
+        # ══ КОНЕЦ ════════════════════════════════════════════════════════
+        R.append("")
+        hr1()
+        R.append("  Министерство экономического развития Российской Федерации")
+        R.append("  Система интеллектуальной юридической экспертизы НПА")
+        hr1()
+
+        return '\n'.join(R)
 
     # ------------------------------------------------------------------ clear
     def clear_results(self):
